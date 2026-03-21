@@ -44,6 +44,25 @@ class JavaFile:
 
 
 @dataclass
+class PythonFile:
+    path: Path
+    relative_path: str
+    content: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass
+class TypeScriptFile:
+    path: Path
+    relative_path: str
+    content: str
+    sha256: str
+    size_bytes: int
+    file_type: str   # ".ts" | ".tsx" | ".js"
+
+
+@dataclass
 class InfraFile:
     path: Path
     relative_path: str
@@ -181,6 +200,100 @@ class RepoCrawler:
                     pass
 
         return infra_files
+
+    def collect_python_files(self, max_files: int = 150) -> List[PythonFile]:
+        """Collect .py files, skipping __pycache__, migrations, venv."""
+        SKIP_PY_DIRS = SKIP_DIRS | {"migrations", "venv", ".venv", "env", "site-packages"}
+        py_files: List[PythonFile] = []
+
+        def priority(p: Path) -> int:
+            s = str(p)
+            if "test" in s.lower():
+                return 2
+            if "__init__" in s:
+                return 1
+            return 0
+
+        all_py = sorted(self.repo_root.rglob("*.py"), key=priority)
+
+        for py_path in all_py:
+            if len(py_files) >= max_files:
+                break
+            rel = py_path.relative_to(self.repo_root)
+            if any(part in SKIP_PY_DIRS for part in rel.parts):
+                continue
+            try:
+                content = py_path.read_text(encoding="utf-8", errors="replace")
+                sha = self._sha256(content)
+                py_files.append(PythonFile(
+                    path=py_path,
+                    relative_path=str(rel),
+                    content=content,
+                    sha256=sha,
+                    size_bytes=py_path.stat().st_size,
+                ))
+            except Exception:
+                continue
+        return py_files
+
+    def collect_ts_files(self, max_files: int = 150) -> List[TypeScriptFile]:
+        """Collect .ts/.tsx files, skipping node_modules, dist, .spec files optionally."""
+        SKIP_TS_DIRS = SKIP_DIRS | {".angular", ".cache"}
+        ts_files: List[TypeScriptFile] = []
+
+        def priority(p: Path) -> int:
+            s = str(p)
+            if ".spec." in s or ".test." in s:
+                return 3
+            if "node_modules" in s:
+                return 4
+            if ".module." in s or ".component." in s or ".service." in s:
+                return 0
+            return 1
+
+        all_ts = sorted(
+            list(self.repo_root.rglob("*.ts")) + list(self.repo_root.rglob("*.tsx")),
+            key=priority
+        )
+
+        for ts_path in all_ts:
+            if len(ts_files) >= max_files:
+                break
+            rel = ts_path.relative_to(self.repo_root)
+            if any(part in SKIP_TS_DIRS for part in rel.parts):
+                continue
+            # Skip .d.ts declaration files
+            if ts_path.name.endswith(".d.ts"):
+                continue
+            try:
+                content = ts_path.read_text(encoding="utf-8", errors="replace")
+                sha = self._sha256(content)
+                ts_files.append(TypeScriptFile(
+                    path=ts_path,
+                    relative_path=str(rel),
+                    content=content,
+                    sha256=sha,
+                    size_bytes=ts_path.stat().st_size,
+                    file_type=ts_path.suffix,
+                ))
+            except Exception:
+                continue
+        return ts_files
+
+    def detect_languages(self) -> List[str]:
+        """Quick scan to detect which languages are present in the repo."""
+        langs = []
+        if any(self.repo_root.rglob("*.java")):
+            langs.append("java")
+        if any(self.repo_root.rglob("*.py")):
+            langs.append("python")
+        if any(self.repo_root.rglob("*.ts")):
+            langs.append("typescript")
+            # Detect Angular specifically
+            if any(self.repo_root.rglob("angular.json")) or \
+               any(self.repo_root.rglob(".angular")):
+                langs.append("angular")
+        return langs
 
     def _extract_package(self, content: str) -> Optional[str]:
         """Quick regex-free package extraction from Java source."""

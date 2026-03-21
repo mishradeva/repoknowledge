@@ -50,6 +50,73 @@ class ClaudeAnalyzer:
         self.verbose = verbose
         self.cache: Dict[str, Any] = {}
 
+    def analyse_polyglot(
+        self,
+        all_modules: list,          # unified dicts from cli._wrap_*
+        infra_files: list,
+        repo_name: str,
+        detected_languages: list,
+    ) -> RepoAnalysis:
+        """Entry point for polyglot repos. Wraps the 3-pass pipeline."""
+        if self.verbose:
+            print(f"  Polyglot analysis: {len(all_modules)} modules, langs={detected_languages}")
+
+        module_summaries = self._pass1_generic(all_modules)
+        service_groups, infra_summary = self._pass2_service_level(
+            module_summaries, infra_files, repo_name
+        )
+        system = self._pass3_system_level(
+            module_summaries, service_groups, infra_summary, repo_name
+        )
+
+        all_endpoints = []
+        for m in all_modules:
+            for ep in (m.get("endpoints") or []):
+                cls = m.get("_class", "")
+                if isinstance(ep, dict):
+                    all_endpoints.append({**ep, "class": cls})
+
+        data_models = []
+        for m in all_modules:
+            role = (m.get("_role") or "").lower()
+            if any(k in role for k in ("entity", "model", "pydantic", "schema", "dto")):
+                fields = m.get("fields", [])
+                if not fields:
+                    # Python: grab class attributes
+                    for cls in m.get("classes", []):
+                        fields = [{"name": a.split(":")[0].strip(), "type": a.split(":")[-1].strip()}
+                                  for a in cls.get("attributes", [])[:10]]
+                        break
+                data_models.append({
+                    "class": m.get("_class", ""),
+                    "package": m.get("package", m.get("_path", "")),
+                    "fields": fields,
+                })
+
+        dep_map = {}
+        for m in all_modules:
+            cls = m.get("_class", "")
+            deps = m.get("dependencies", [])
+            if cls and deps:
+                dep_map[cls] = deps
+
+        return RepoAnalysis(
+            repo_name=repo_name,
+            system_purpose=system.get("system_purpose", ""),
+            tech_stack=system.get("tech_stack", []),
+            architecture_style=system.get("architecture_style", "layered"),
+            modules=module_summaries,
+            services=service_groups,
+            dependencies=dep_map,
+            endpoints=all_endpoints,
+            infra_summary=infra_summary,
+            mermaid_architecture=system.get("mermaid_architecture", ""),
+            mermaid_components=system.get("mermaid_components", ""),
+            mermaid_sequence=system.get("mermaid_sequence", ""),
+            data_models=data_models,
+            key_packages=system.get("key_packages", []),
+        )
+
     def analyse(
         self,
         parsed_modules: List[ParsedJavaFile],
@@ -111,6 +178,64 @@ class ClaudeAnalyzer:
             data_models=data_models,
             key_packages=system.get("key_packages", []),
         )
+
+    # ------------------------------------------------------------------ #
+    #  Pass 1 (generic): works for any language via unified dict format   #
+    # ------------------------------------------------------------------ #
+    def _pass1_generic(self, modules: list) -> List[Dict]:
+        summaries = []
+
+        def analyse_one(m: dict) -> dict:
+            cache_key = hashlib.md5(
+                (str(m.get("_path", "")) + str(m.get("snippet", ""))[:500]).encode()
+            ).hexdigest()
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+
+            lang = m.get("language", "unknown")
+            prompt = f"""Analyse this {lang} source file and return JSON.
+
+FILE: {m.get('_path', '')}
+ROLE (inferred): {m.get('_role', '')}
+LANGUAGE: {lang}
+
+MODULE DATA:
+{json.dumps({k: v for k, v in m.items() if not k.startswith('snippet')}, indent=2)[:3000]}
+
+SOURCE SNIPPET:
+```
+{m.get('snippet', '')[:1200]}
+```"""
+            result = self._call_claude(
+                system=MODULE_SYSTEM_PROMPT,
+                user=prompt,
+                label=f"module:{m.get('_class', '')}",
+            )
+            result["_path"] = m.get("_path", "")
+            result["_class"] = m.get("_class", "")
+            result["_role"] = m.get("_role", "")
+            result["_language"] = lang
+            self.cache[cache_key] = result
+            return result
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures = {ex.submit(analyse_one, m): m for m in modules}
+            for future in as_completed(futures):
+                m = futures[future]
+                try:
+                    summaries.append(future.result())
+                except Exception as e:
+                    summaries.append({
+                        "_path": m.get("_path", ""),
+                        "_class": m.get("_class", ""),
+                        "_role": m.get("_role", ""),
+                        "_language": m.get("language", ""),
+                        "purpose": f"Analysis error: {e}",
+                        "responsibilities": [],
+                        "dependencies": m.get("dependencies", []),
+                        "endpoints": m.get("endpoints", []),
+                    })
+        return summaries
 
     # ------------------------------------------------------------------ #
     #  Pass 1: per-file module summaries                                   #
